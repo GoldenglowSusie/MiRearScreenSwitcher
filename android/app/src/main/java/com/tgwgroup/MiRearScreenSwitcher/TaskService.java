@@ -29,12 +29,19 @@ public class TaskService extends ITaskService.Stub {
 
     @Keep
     public TaskService() {
-
+        // 确保Service正确初始化
     }
 
     @Override
     public void destroy() {
-
+        try {
+            // 给系统一些时间来处理pending的Binder调用
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        
+        // 优雅退出
         System.exit(0);
     }
 

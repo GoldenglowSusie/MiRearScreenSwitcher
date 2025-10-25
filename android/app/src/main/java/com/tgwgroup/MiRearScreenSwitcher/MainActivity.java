@@ -298,12 +298,37 @@ public class MainActivity extends FlutterActivity {
     protected void onDestroy() {
         super.onDestroy();
         
-        // 清除静态实例
-        currentInstance = null;
-        
-        Shizuku.removeBinderReceivedListener(binderReceivedListener);
-        Shizuku.removeBinderDeadListener(binderDeadListener);
-        Shizuku.removeRequestPermissionResultListener(requestPermissionResultListener);
+        try {
+            // 先断开TaskService连接
+            if (taskService != null) {
+                try {
+                    Shizuku.unbindUserService(serviceArgs, taskServiceConnection, true);
+                } catch (Exception e) {
+                    Log.w(TAG, "Error unbinding TaskService during destroy", e);
+                }
+                taskService = null;
+            }
+            
+            // 清除静态实例
+            currentInstance = null;
+            
+            // 移除Shizuku监听器
+            try {
+                Shizuku.removeBinderReceivedListener(binderReceivedListener);
+                Shizuku.removeBinderDeadListener(binderDeadListener);
+                Shizuku.removeRequestPermissionResultListener(requestPermissionResultListener);
+            } catch (Exception e) {
+                Log.w(TAG, "Error removing Shizuku listeners", e);
+            }
+            
+            // 清理MethodChannel
+            if (methodChannel != null) {
+                methodChannel.setMethodCallHandler(null);
+                methodChannel = null;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error during onDestroy", e);
+        }
     }
     
     @Override
@@ -554,12 +579,26 @@ public class MainActivity extends FlutterActivity {
                     
                     case "returnRearAppAndRestart": {
                         // 重启前先拉回背屏应用
-                        if (taskService != null) {
-                            try {
-                                // 获取最后移动的任务信息
-                                String lastTask = SwitchToRearTileService.getLastMovedTask();
-                                
-                                if (lastTask != null && lastTask.contains(":")) {
+                        try {
+                            // 首先确保TaskService可用
+                            if (taskService == null) {
+                                Log.w(TAG, "TaskService not available, trying to reconnect...");
+                                bindTaskService();
+                                // 等待连接
+                                Thread.sleep(500);
+                            }
+                            
+                            if (taskService == null) {
+                                Log.w(TAG, "TaskService still not available, skipping app return");
+                                result.success(false);
+                                break;
+                            }
+                            
+                            // 获取最后移动的任务信息
+                            String lastTask = SwitchToRearTileService.getLastMovedTask();
+                            
+                            if (lastTask != null && lastTask.contains(":")) {
+                                try {
                                     String[] parts = lastTask.split(":");
                                     int taskId = Integer.parseInt(parts[1]);
                                     
@@ -578,16 +617,20 @@ public class MainActivity extends FlutterActivity {
                                         // 没有应用在背屏
                                         result.success(false);
                                     }
-                                } else {
-                                    // 没有记录
+                                } catch (NumberFormatException e) {
+                                    Log.e(TAG, "Invalid taskId format in lastTask: " + lastTask, e);
                                     result.success(false);
+                                } catch (Exception e) {
+                                    Log.e(TAG, "Failed to return rear app to main display", e);
+                                    result.success(false); // 返回false而不是error，避免崩溃
                                 }
-                            } catch (Exception e) {
-                                Log.e(TAG, "Failed to return rear app", e);
-                                result.error("ERROR", e.getMessage(), null);
+                            } else {
+                                // 没有记录
+                                result.success(false);
                             }
-                        } else {
-                            result.error("ERROR", "TaskService not available", null);
+                        } catch (Exception e) {
+                            Log.e(TAG, "Unexpected error in returnRearAppAndRestart", e);
+                            result.success(false); // 返回false而不是error，避免崩溃
                         }
                         break;
                     }
@@ -719,7 +762,13 @@ public class MainActivity extends FlutterActivity {
                                     Log.w(TAG, "⚠️ 没有QUERY_ALL_PACKAGES权限，应用列表可能不完整");
                                 }
                                 
-                                java.util.List<java.util.Map<String, Object>> apps = getInstalledApps();
+                                // 从参数中获取是否包含系统应用的设置
+                                boolean includeSystemApps = false;
+                                if (call.argument("includeSystemApps") != null) {
+                                    includeSystemApps = call.argument("includeSystemApps");
+                                }
+                                
+                                java.util.List<java.util.Map<String, Object>> apps = getInstalledApps(includeSystemApps);
                                 runOnUiThread(() -> result.success(apps));
                             } catch (Exception e) {
                                 Log.e(TAG, "Failed to get installed apps", e);
@@ -873,6 +922,10 @@ public class MainActivity extends FlutterActivity {
      * V2.4: 获取已安装应用列表
      */
     private java.util.List<java.util.Map<String, Object>> getInstalledApps() {
+        return getInstalledApps(false); // 默认不包含所有系统应用
+    }
+    
+    private java.util.List<java.util.Map<String, Object>> getInstalledApps(boolean includeSystemApps) {
         java.util.List<java.util.Map<String, Object>> apps = new java.util.ArrayList<>();
         
         try {
@@ -880,6 +933,7 @@ public class MainActivity extends FlutterActivity {
             java.util.List<android.content.pm.ApplicationInfo> packages = pm.getInstalledApplications(PackageManager.GET_META_DATA);
             
             Log.d(TAG, "Total packages found: " + packages.size());
+            Log.d(TAG, "Include system apps: " + includeSystemApps);
             
             // 使用白名单策略（用户应用 + 重要系统应用）
             java.util.Set<String> importantSystemApps = new java.util.HashSet<>();
@@ -895,6 +949,8 @@ public class MainActivity extends FlutterActivity {
             importantSystemApps.add("com.android.mms"); // 短信
             importantSystemApps.add("com.android.contacts"); // 联系人
             
+            // 优化1: 预过滤应用列表，减少后续处理
+            java.util.List<android.content.pm.ApplicationInfo> filteredPackages = new java.util.ArrayList<>();
             for (android.content.pm.ApplicationInfo appInfo : packages) {
                 // 跳过自己
                 if (appInfo.packageName.equals(getPackageName())) {
@@ -905,40 +961,89 @@ public class MainActivity extends FlutterActivity {
                 boolean isUserApp = !isSystemApp;
                 boolean isImportantSystemApp = importantSystemApps.contains(appInfo.packageName);
                 
-                // 只包含用户应用或重要系统应用
-                if (!isUserApp && !isImportantSystemApp) {
-                    continue;
+                // 根据参数决定是否包含系统应用
+                if (isUserApp || isImportantSystemApp || (includeSystemApps && isSystemApp)) {
+                    filteredPackages.add(appInfo);
                 }
-                
+            }
+            
+            Log.d(TAG, "Filtered packages: " + filteredPackages.size());
+            
+            // 优化2: 使用高分辨率图标和异步处理
+            final int ICON_SIZE = 192; // 提高到192x192尺寸，增强清晰度
+            java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(4);
+            
+            for (android.content.pm.ApplicationInfo appInfo : filteredPackages) {
                 java.util.Map<String, Object> app = new java.util.HashMap<>();
                 app.put("appName", pm.getApplicationLabel(appInfo).toString());
                 app.put("packageName", appInfo.packageName);
                 
-                // 获取应用图标（全分辨率，不压缩不受损）
-                try {
-                    Drawable icon = pm.getApplicationIcon(appInfo);
-                    // 使用原始图标尺寸，不限制大小
-                    int iconSize = Math.max(icon.getIntrinsicWidth(), icon.getIntrinsicHeight());
-                    if (iconSize <= 0) iconSize = 192; // 如果无法获取，使用默认高分辨率
-                    
-                    android.graphics.Bitmap bitmap = android.graphics.Bitmap.createBitmap(
-                        iconSize, iconSize, android.graphics.Bitmap.Config.ARGB_8888
-                    );
-                    android.graphics.Canvas canvas = new android.graphics.Canvas(bitmap);
-                    icon.setBounds(0, 0, iconSize, iconSize);
-                    icon.draw(canvas);
-                    
-                    java.io.ByteArrayOutputStream stream = new java.io.ByteArrayOutputStream();
-                    bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, stream); // 100%质量，无损压缩
-                    app.put("icon", stream.toByteArray());
-                    
-                    bitmap.recycle();
-                } catch (Exception e) {
-                    Log.w(TAG, "Failed to get icon for " + appInfo.packageName);
-                }
+                // 添加系统应用标识，供Flutter端过滤使用
+                boolean isSystemApp = (appInfo.flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0;
+                boolean isImportantSystemApp = importantSystemApps.contains(appInfo.packageName);
+                app.put("isSystemApp", isSystemApp);
+                app.put("isImportantSystemApp", isImportantSystemApp);
                 
+                // 优化3: 延迟图标加载，先添加基本信息
                 apps.add(app);
             }
+            
+            // 优化4: 并行处理图标，使用更高效的压缩
+            java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(filteredPackages.size());
+            for (int i = 0; i < filteredPackages.size(); i++) {
+                final int index = i;
+                final android.content.pm.ApplicationInfo appInfo = filteredPackages.get(i);
+                final java.util.Map<String, Object> app = apps.get(index);
+                
+                executor.submit(() -> {
+                    try {
+                        Drawable icon = pm.getApplicationIcon(appInfo);
+                        
+                        // 获取原始图标尺寸
+                        int originalWidth = icon.getIntrinsicWidth();
+                        int originalHeight = icon.getIntrinsicHeight();
+                        if (originalWidth <= 0) originalWidth = 192;
+                        if (originalHeight <= 0) originalHeight = 192;
+                        
+                        // 创建原始尺寸的bitmap
+                        android.graphics.Bitmap originalBitmap = android.graphics.Bitmap.createBitmap(
+                            originalWidth, originalHeight, android.graphics.Bitmap.Config.ARGB_8888
+                        );
+                        android.graphics.Canvas originalCanvas = new android.graphics.Canvas(originalBitmap);
+                        icon.setBounds(0, 0, originalWidth, originalHeight);
+                        icon.draw(originalCanvas);
+                        
+                        // 使用高质量缩放算法
+                        android.graphics.Bitmap scaledBitmap = android.graphics.Bitmap.createScaledBitmap(
+                            originalBitmap, ICON_SIZE, ICON_SIZE, true // 使用双线性插值
+                        );
+                        
+                        java.io.ByteArrayOutputStream stream = new java.io.ByteArrayOutputStream();
+                        // 使用最高质量PNG压缩，保持清晰度
+                        scaledBitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, stream);
+                        app.put("icon", stream.toByteArray());
+                        
+                        originalBitmap.recycle();
+                        scaledBitmap.recycle();
+                    } catch (Exception e) {
+                        Log.w(TAG, "Failed to get icon for " + appInfo.packageName);
+                        // 设置空图标占位
+                        app.put("icon", new byte[0]);
+                    } finally {
+                        latch.countDown();
+                    }
+                });
+            }
+            
+            // 等待所有图标处理完成，但设置超时避免长时间阻塞
+            try {
+                latch.await(5, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Log.w(TAG, "Icon loading interrupted");
+                Thread.currentThread().interrupt();
+            }
+            
+            executor.shutdown();
             
             // 按应用名排序
             apps.sort((a, b) -> {
@@ -947,7 +1052,7 @@ public class MainActivity extends FlutterActivity {
                 return nameA.compareToIgnoreCase(nameB);
             });
             
-            Log.d(TAG, "Found " + apps.size() + " user apps");
+            Log.d(TAG, "Found " + apps.size() + " user apps (optimized loading)");
             
         } catch (Exception e) {
             Log.e(TAG, "Failed to get installed apps", e);

@@ -15,6 +15,7 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 import 'dart:async';
 // 删除未使用的dart:io导入
 import 'dart:ui';
@@ -23,6 +24,12 @@ import 'dart:typed_data';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
+  // 设置错误处理，防止Dart编译器异常退出
+  FlutterError.onError = (FlutterErrorDetails details) {
+    print('Flutter错误: ${details.exception}');
+    print('堆栈跟踪: ${details.stack}');
+  };
+  
   // 设置沉浸式状态栏（透明状态栏）
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
@@ -32,6 +39,13 @@ void main() {
     systemNavigationBarIconBrightness: Brightness.light,
   ));
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+  
+  // 添加异常捕获
+  PlatformDispatcher.instance.onError = (error, stack) {
+    print('平台错误: $error');
+    print('堆栈跟踪: $stack');
+    return true;
+  };
   
   runApp(const DisplaySwitcherApp());
 }
@@ -322,13 +336,23 @@ class _HomePageState extends State<HomePage> {
   
   
   
-  // V2.1: 重启应用
+  // V2.1: 重启应用（实际是返回背屏应用到主屏）
   Future<void> _restartApp() async {
     if (_isLoading) return;
     
     setState(() => _isLoading = true);
     
     try {
+      // 检查Shizuku是否可用
+      if (!_shizukuRunning) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Shizuku未运行，无法操作')),
+          );
+        }
+        return;
+      }
+      
       // 确保TaskService连接
       await platform.invokeMethod('ensureTaskServiceConnected');
       await Future.delayed(const Duration(milliseconds: 500));
@@ -337,15 +361,32 @@ class _HomePageState extends State<HomePage> {
       final result = await platform.invokeMethod('returnRearAppAndRestart');
       
       if (result == true) {
-        // 成功返回主屏，退出应用
-        SystemNavigator.pop();
+        // 成功返回主屏
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('应用已返回主屏')),
+          );
+        }
       } else {
-        // 没有应用在背屏，直接退出
-        SystemNavigator.pop();
+        // 没有应用在背屏
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('背屏没有应用需要返回')),
+          );
+        }
       }
     } catch (e) {
-      // 出错也退出
-      SystemNavigator.pop();
+      print('返回背屏应用时出错: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('操作失败: $e')),
+        );
+      }
+    } finally {
+      // 重置加载状态
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
     }
   }
   
@@ -538,8 +579,8 @@ class _HomePageState extends State<HomePage> {
         actions: [
           IconButton(
             icon: const Icon(Icons.restart_alt),
-            onPressed: _restartApp,
-            tooltip: '重启软件',
+            onPressed: _isLoading ? null : _restartApp,
+            tooltip: '返回背屏应用到主屏',
           ),
         ],
       ),
@@ -1570,49 +1611,65 @@ class _AppListItem extends StatelessWidget {
         onTap: onToggle,
         splashColor: const Color(0x20FFB5C5), // 浅浅的粉红色（四色渐变中间色）
         highlightColor: const Color(0x10E0B5DC), // 浅浅的紫色高光
+        radius: 8, // 优化：减少波纹计算
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
           child: Row(
             children: [
-              // 图标（全分辨率，不压缩不受损）
-              if (iconBytes != null)
-                Image.memory(
-                  iconBytes!,
-                  width: 48,
-                  height: 48,
-                  fit: BoxFit.contain,
-                  gaplessPlayback: true,
-                  filterQuality: FilterQuality.high,
-                  isAntiAlias: true,
-                )
-              else
-                const Icon(Icons.android, size: 48, color: Colors.white),
+              // 图标优化：使用RepaintBoundary减少重绘
+              RepaintBoundary(
+                child: iconBytes != null
+                    ? Image.memory(
+                        iconBytes!,
+                        width: 48,
+                        height: 48,
+                        fit: BoxFit.contain,
+                        gaplessPlayback: true,
+                        filterQuality: FilterQuality.medium, // 优化：降低滤镜质量提升性能
+                        isAntiAlias: false, // 优化：禁用抗锯齿提升性能
+                        cacheWidth: 96, // 优化：缓存缩放后的尺寸
+                        cacheHeight: 96,
+                      )
+                    : const Icon(Icons.android, size: 48, color: Colors.white),
+              ),
               const SizedBox(width: 12),
-              // 文本
+              // 文本优化：使用RepaintBoundary
               Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      appName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: Colors.white, fontSize: 15),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      packageName,
-                      style: const TextStyle(fontSize: 11, color: Colors.white70),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ],
+                child: RepaintBoundary(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text(
+                        appName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white, 
+                          fontSize: 15,
+                          height: 1.2, // 优化：固定行高
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        packageName,
+                        style: const TextStyle(
+                          fontSize: 11, 
+                          color: Colors.white70,
+                          height: 1.2, // 优化：固定行高
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                  ),
                 ),
               ),
               const SizedBox(width: 8),
-              // 渐变复选框
-              _GradientCheckbox(value: isSelected, onChanged: (_) => onToggle()),
+              // 渐变复选框优化：使用RepaintBoundary
+              RepaintBoundary(
+                child: _GradientCheckbox(value: isSelected, onChanged: (_) => onToggle()),
+              ),
             ],
           ),
         ),
@@ -1632,73 +1689,77 @@ class _GradientCheckbox extends StatefulWidget {
   State<_GradientCheckbox> createState() => _GradientCheckboxState();
 }
 
-class _GradientCheckboxState extends State<_GradientCheckbox> {
+class _GradientCheckboxState extends State<_GradientCheckbox> with SingleTickerProviderStateMixin {
   bool _pressed = false;
+  late AnimationController _controller;
+  late Animation<double> _scaleAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      duration: const Duration(milliseconds: 100),
+      vsync: this,
+    );
+    _scaleAnimation = Tween<double>(begin: 1.0, end: 0.95).animate(
+      CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      onTapDown: (_) => setState(() => _pressed = true),
-      onTapUp: (_) => setState(() => _pressed = false),
-      onTapCancel: () => setState(() => _pressed = false),
+      onTapDown: (_) {
+        setState(() => _pressed = true);
+        _controller.forward();
+      },
+      onTapUp: (_) {
+        setState(() => _pressed = false);
+        _controller.reverse();
+      },
+      onTapCancel: () {
+        setState(() => _pressed = false);
+        _controller.reverse();
+      },
       onTap: () => widget.onChanged(!widget.value),
-      child: AnimatedScale(
-        duration: const Duration(milliseconds: 120),
-        scale: _pressed ? 0.9 : 1.0,
-        child: ClipPath(
-          clipper: _SquircleClipper(cornerRadius: _SquircleRadii.checkbox),
-          child: Container(
-            width: 24,
-            height: 24,
-            child: Stack(
-              children: [
-                // 底层半透明背景
-                Container(
-                  color: Colors.white.withOpacity(0.25),
-                ),
-                // 渐变层（淡入淡出）
-                AnimatedOpacity(
-                  duration: const Duration(milliseconds: 200),
-                  opacity: widget.value ? 1.0 : 0.0,
-                  child: Container(
-                    decoration: const BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                        colors: [
-                          Color(0xFFFF9D88),
-                          Color(0xFFFFB5C5),
-                          Color(0xFFE0B5DC),
-                          Color(0xFFA8C5E5),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-                // 边框（渐隐）- 使用CustomPaint绘制超椭圆边框
-                AnimatedOpacity(
-                  duration: const Duration(milliseconds: 200),
-                  opacity: widget.value ? 0.0 : 1.0,
-                  child: CustomPaint(
-                    painter: _SquircleBorderPainter(
-                      radius: _SquircleRadii.checkbox,
-                      color: Colors.white.withOpacity(0.4),
-                      strokeWidth: 2,
-                    ),
-                  ),
-                ),
-                // 对勾（缩放弹出）
-                Center(
-                  child: AnimatedScale(
-                    duration: const Duration(milliseconds: 200),
-                    curve: Curves.easeOutBack,
-                    scale: widget.value ? 1.0 : 0.0,
-                    child: const Icon(Icons.check, size: 18, color: Colors.white),
-                  ),
-                ),
+      child: AnimatedBuilder(
+        animation: _scaleAnimation,
+        builder: (context, child) {
+          return Transform.scale(
+            scale: _scaleAnimation.value,
+            child: child,
+          );
+        },
+        child: Container(
+          width: 24,
+          height: 24,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(6),
+            color: Colors.white.withOpacity(0.25),
+            gradient: widget.value ? const LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [
+                Color(0xFFFF9D88),
+                Color(0xFFFFB5C5),
+                Color(0xFFE0B5DC),
+                Color(0xFFA8C5E5),
               ],
+            ) : null,
+            border: widget.value ? null : Border.all(
+              color: Colors.white.withOpacity(0.4),
+              width: 2,
             ),
           ),
+          child: widget.value 
+              ? const Icon(Icons.check, size: 18, color: Colors.white)
+              : null,
         ),
       ),
     );
@@ -2030,25 +2091,97 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
   // 内部加载方法（不检查权限，直接加载）
   Future<void> _loadAppsInternal() async {
     try {
+      // 优化1: 先显示加载状态，避免界面卡顿
+      if (mounted) {
+        setState(() {
+          _isLoading = true;
+        });
+      }
+      
       // 加载已选择的应用
       final List<dynamic> selectedApps = await platform.invokeMethod('getSelectedNotificationApps');
       _selectedApps = selectedApps.cast<String>().toSet();
       
-      // 加载所有应用
-      final List<dynamic> apps = await platform.invokeMethod('getInstalledApps');
-      
-      setState(() {
-        _apps = apps.map((app) => Map<String, dynamic>.from(app)).toList();
-        _isLoading = false;
+      // 直接加载应用列表，移除有问题的compute调用
+      final List<dynamic> apps = await platform.invokeMethod('getInstalledApps', {
+        'includeSystemApps': _includeSystemApps
       });
       
-      _applyFilters();
-      
-      print('已加载 ${_apps.length} 个应用');
+      if (mounted) {
+        setState(() {
+          _apps = apps.map((app) => Map<String, dynamic>.from(app)).toList();
+          _isLoading = false;
+        });
+        
+        _applyFilters();
+        
+        print('已加载 ${_apps.length} 个应用');
+      }
     } catch (e) {
       print('加载应用列表失败: $e');
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+  
+  // 根据系统应用开关重新加载应用列表（局部刷新）
+  Future<void> _loadAppsWithSystemFilter() async {
+    try {
+      // 显示加载指示器，但不重建整个页面
+      if (mounted) {
+        setState(() {
+          _isLoading = true;
+        });
+      }
+      
+      // 根据开关状态重新获取应用列表
+      final List<dynamic> apps = await platform.invokeMethod('getInstalledApps', {
+        'includeSystemApps': _includeSystemApps
+      });
+      
+      if (mounted) {
+        // 只更新应用数据，避免不必要的页面重建
+        setState(() {
+          _apps = apps.map((app) => Map<String, dynamic>.from(app)).toList();
+          _isLoading = false;
+        });
+        
+        // 重新应用过滤器以确保列表正确更新
+        _applyFilters();
+        
+        print('已重新加载 ${_apps.length} 个应用（系统应用开关：$_includeSystemApps）');
+      }
+    } catch (e) {
+      print('重新加载应用列表失败: $e');
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+  
+  // 静默更新过滤器，避免额外重建
+  void _applyFiltersSilently() {
+    final String q = _searchController.text.trim().toLowerCase();
+    List<Map<String, dynamic>> filtered = _apps.where((app) {
+      final String name = (app['appName'] ?? '').toString().toLowerCase();
+      final String pkg = (app['packageName'] ?? '').toString().toLowerCase();
+      final bool matchesQuery = q.isEmpty || name.contains(q) || pkg.contains(q);
+      // 当不显示系统应用时，过滤掉系统应用
+      if (!_includeSystemApps && _isSystemApp(app)) {
+        return false;
+      }
+      return matchesQuery;
+    }).toList();
+    
+    // 只更新可见列表，避免全页面重建
+    if (mounted) {
       setState(() {
-        _isLoading = false;
+        _visibleApps = filtered;
       });
     }
   }
@@ -2071,9 +2204,13 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
 
   bool _isSystemApp(Map<String, dynamic> app) {
     final pkg = (app['packageName'] ?? '').toString();
-    final dynamic flag1 = app['isSystem'];
-    final dynamic flag2 = app['isSystemApp'];
-    if (flag1 == true || flag2 == true) return true;
+    final dynamic isSystemApp = app['isSystemApp'];
+    final dynamic isImportantSystemApp = app['isImportantSystemApp'];
+    
+    // 优先使用Android端传递的系统应用标识
+    if (isSystemApp == true && isImportantSystemApp != true) return true;
+    
+    // 备用检测逻辑
     return pkg.startsWith('com.android.') || pkg.startsWith('com.google.android.') || pkg.startsWith('android');
   }
 
@@ -2643,9 +2780,11 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
                                       const SizedBox(width: 6),
                                       _GradientToggle(
                                         value: _includeSystemApps,
-                                        onChanged: (v) {
+                                        onChanged: (v) async {
+                                          // 立即更新UI状态，提供即时反馈
                                           setState(() => _includeSystemApps = v);
-                                          _applyFilters();
+                                          // 异步加载应用列表，不阻塞UI
+                                          await _loadAppsWithSystemFilter();
                                         },
                                       ),
                                     ],
@@ -2657,30 +2796,35 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
                         ),
                       ),
                       const SizedBox(height: 20),
-                      // 应用列表
+                      // 应用列表 - 使用RepaintBoundary隔离重绘
                       Expanded(
-                        child: ListView.builder(
-                          itemCount: _visibleApps.length,
-                          padding: const EdgeInsets.symmetric(vertical: 8),
-                          itemExtent: 72,
-                          cacheExtent: 500,
-                          addAutomaticKeepAlives: false,
-                          addRepaintBoundaries: true,
-                          physics: const ClampingScrollPhysics(),
-                          itemBuilder: (context, index) {
-                            final app = _visibleApps[index];
-                            final String appName = app['appName'];
-                            final String packageName = app['packageName'];
-                            final Uint8List? iconBytes = app['icon'];
-                            final bool isSelected = _selectedApps.contains(packageName);
-                            return _AppListItem(
-                              appName: appName,
-                              packageName: packageName,
-                              iconBytes: iconBytes,
-                              isSelected: isSelected,
-                              onToggle: () => _toggleApp(packageName, !isSelected),
-                            );
-                          },
+                        child: RepaintBoundary(
+                          child: ListView.builder(
+                            itemCount: _visibleApps.length,
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            itemExtent: 72,
+                            cacheExtent: 2000, // 增加缓存范围
+                            addAutomaticKeepAlives: false,
+                            addRepaintBoundaries: false, // 优化：减少重绘边界
+                            addSemanticIndexes: false, // 优化：减少语义索引
+                            physics: const BouncingScrollPhysics(
+                              parent: ClampingScrollPhysics(),
+                            ),
+                            itemBuilder: (context, index) {
+                              final app = _visibleApps[index];
+                              final String appName = app['appName'];
+                              final String packageName = app['packageName'];
+                              final Uint8List? iconBytes = app['icon'];
+                              final bool isSelected = _selectedApps.contains(packageName);
+                              return _AppListItem(
+                                appName: appName,
+                                packageName: packageName,
+                                iconBytes: iconBytes,
+                                isSelected: isSelected,
+                                onToggle: () => _toggleApp(packageName, !isSelected),
+                              );
+                            },
+                          ),
                         ),
                       ),
                     ],
